@@ -95,3 +95,222 @@ del train_features
 val_dataset = SAKTDataset(val_features,val_targets)
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 del val_features
+
+## Model Define
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+### Positional Encoding with multi LSTMs
+class ResidualLSTM(nn.Module):
+
+    def __init__(self, d_model):
+        super(ResidualLSTM, self).__init__()
+        self.LSTM=nn.LSTM(d_model, d_model, num_layers=1, bidirectional=True) # non-stacking LSTM, bidirectional so output dimension is doubled
+        self.linear1=nn.Linear(d_model*2, d_model*4)
+        self.linear2=nn.Linear(d_model*4, d_model)
+
+
+    def forward(self, x):
+        res=x
+        x, _ = self.LSTM(x)
+        x=F.relu(self.linear1(x))
+        x=self.linear2(x)
+        x=res+x
+        return x
+    
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, downsample=None):
+        super(ResidualBlock, self).__init__()
+        padding = (kernel_size - 1) // 2  # This ensures the output has the same spatial dimensions as the input
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding=padding)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, stride=1, padding=padding)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample:
+            residual = self.downsample(x)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class Net(nn.Module):  ### initial input [128,2160]
+    def __init__(self, n_skill=1, embed_dim=64, nnlayers=2, nhead=8, nlayers=2,dropout=0.1):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv1d(64, 64, 7, 2, 3)  # initial convolution [128,1,2160] to [128, 64, 2160]
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(0.1)
+        self.maxpool = nn.MaxPool1d(3, 2, 1)
+        
+        self.layer1 = self.make_layer(ResidualBlock, 64,  64, 3)
+        self.layer2 = self.make_layer(ResidualBlock, 64, 128, 4, stride=2)
+        self.layer3 = self.make_layer(ResidualBlock, 128, 256, 6, stride=2)
+        self.layer4 = self.make_layer(ResidualBlock, 256, 512, 3, stride=2)
+        self.layer5 = self.make_layer(ResidualBlock, 512, 256, 3, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(256, 6)
+
+        ### added pos_encoder
+        self.embedding = nn.Linear(n_skill, embed_dim)
+        self.pos_encoder = nn.ModuleList([ResidualLSTM(embed_dim) for i in range(nnlayers)])
+        self.pos_drop = nn.Dropout(dropout)
+
+        ### added transformer encoder
+        encoder_layers = [nn.TransformerEncoderLayer(embed_dim, nhead, embed_dim*4, dropout) for i in range(nlayers)]
+        self.transformer_layers = nn.ModuleList(encoder_layers)
+        
+    def make_layer(self, block, in_channels, out_channels, blocks, stride=1):
+        downsample = None
+        if (stride != 1) or (in_channels != out_channels):
+            downsample = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm1d(out_channels))
+        layers = []
+        layers.append(block(in_channels, out_channels, stride=stride, downsample=downsample))
+        for i in range(1, blocks):
+            layers.append(block(out_channels, out_channels))
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):  # input dim [B, S] = [32, 1000]
+        x = x.unsqueeze(2)  # to dim [B, S, F] = [32, 1000, 1]
+        x = self.embedding(x) # to dim [32, 1000, 64]
+        x = x.permute(1,0,2) # to [S, B, F] = [1000, 32, 64]
+        for lstm in self.pos_encoder:
+            lstm.LSTM.flatten_parameters() # optimize memory usage
+            x=lstm(x)
+
+        for transformers in self.transformer_layers:
+            res = x
+            x = transformers(x)
+            x = x + res          # dim [S, B, F]
+
+        x = x.permute(1,2,0)  # dim [B, F, S] = [32, 64, 1000]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.layer5(x)   
+        x = self.avgpool(x)      # [32, 256, 1]
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)           # [32, 6]
+        return x
+
+
+model = Net().to(device)
+#optimizer and criterion
+from pytorch_ranger import Ranger
+optimizer = Ranger(model.parameters(), lr=8e-4)
+criterion = nn.CrossEntropyLoss()
+
+## Training loop
+
+epochs=110
+#val_metric = 100
+best_metric = 0
+cos_epoch=int(epochs*0.75)
+scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,(epochs-cos_epoch)*len(train_dataloader))
+steps_per_epoch=len(train_dataloader)
+val_steps=len(val_dataloader)
+train_losses, valid_losses = [],[]
+
+for epoch in tqdm(range(epochs)):
+    model.train()
+    train_loss=0
+    t=time.time()
+    for step,batch in enumerate(train_dataloader):
+        #series=batch.to(device)#.float()
+        features,targets=batch
+        features=features.to(device)
+        targets=targets.to(device)
+        #exit()
+
+        optimizer.zero_grad()
+        output=model(features)  ## output dim = [32, 6], target dim = [32]
+        #print(output)
+        #print(targets.long())
+        #exit()
+        #exit()
+
+        loss=criterion(output,targets.long())#*loss_weight_vector
+        loss.backward()
+        # with amp.scale_loss(loss, optimizer) as scaled_loss:
+        #     scaled_loss.backward()
+        optimizer.step()
+
+        train_loss+=loss.item()
+        #scheduler.step()
+        print ("Step [{}/{}] Loss: {:.3f} Time: {:.1f}"
+                           .format(step+1, steps_per_epoch, train_loss/(step+1), time.time()-t),end='\r',flush=True)
+        if epoch > cos_epoch:
+            scheduler.step()
+        #break
+    print('')
+    train_loss/=(step+1)  ## average train_loss for a certain epoch
+    train_losses.append(train_loss)
+    
+    #exit()
+    model.eval()
+    val_metric=None
+    val_loss=0
+    t=time.time()
+    pred=[]
+    target=[]
+    for step,batch in enumerate(val_dataloader):
+        features,targets=batch
+        features=features.to(device)
+        targets=targets.to(device)
+        with torch.no_grad():
+            output=model(features)
+            _, predict = torch.max(output.data, -1)
+            loss=criterion(output,targets.long())
+            val_loss+=loss.item()
+            #val_metric.append(MCMAE(output.reshape(-1,4),labels.reshape(-1,4),stds[-4:]))
+            pred.extend(predict.cpu().numpy())
+            target.extend(targets.cpu().numpy())
+        print ("Validation Step [{}/{}] Loss: {:.3f} Time: {:.1f}"
+                           .format(step+1, val_steps, val_loss/(step+1), time.time()-t),end='\r',flush=True)
+    pred = np.array(pred)
+    target = np.array(target)
+    val_metric = 100*((np.sum(target == pred))/len(target))
+    #exit()
+    print('')
+    #val_metric=torch.stack(val_metric).mean().cpu().numpy()
+    val_loss/=(step+1)
+    valid_losses.append(val_loss)
+    if val_metric.item() > best_metric:
+        best_metric=val_metric
+        torch.save(model.state_dict(),f'model{fold}_lstm_pe.pth')
+    print(f'best_score:{best_metric}')
+    torch.cuda.empty_cache()
+    gc.collect()
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+
+cm = confusion_matrix(target, pred)
+cm_norm = cm.astype('float')/cm.sum(axis=1)[:, np.newaxis]
+cm_scaled = cm_norm*100
+
+plt.figure(figsize=(10,7))
+sns.heatmap(cm_scaled, annot=True, fmt='.1f', cmap='Blues')
+plt.xlabel('Predicted Labels')
+plt.ylabel('True Labels')
+
