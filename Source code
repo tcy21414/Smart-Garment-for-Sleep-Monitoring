@@ -1,0 +1,97 @@
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import time
+import warnings
+import gc
+import torch
+
+device = torch.device('cuda')
+print(device)
+torch.cuda.empty_cache()
+gc.collect()
+warnings.filterwarnings('ignore')
+
+print("Loading data")
+train = df
+targets = train.iloc[:,-1].to_numpy().astype('int')-1
+print("Dropping some features")
+train.drop(columns=train.columns[-1], axis=1, inplace=True)
+
+from sklearn.preprocessing import RobustScaler, normalize
+print("Normalizing")
+RS = RobustScaler()
+train = RS.fit_transform(train)
+
+#print('Reshaping')
+#train = np.expand_dims(train, axis=2)
+
+## Split train/val set
+from sklearn.model_selection import StratifiedKFold
+import matplotlib.pyplot as plt
+
+skf = StratifiedKFold(n_splits=10, random_state=2024, shuffle=True)
+
+fold=0
+for train_index, val_index in skf.split(train, targets):
+    train_features, val_features = train[train_index], train[val_index]
+    train_targets, val_targets = targets[train_index], targets[val_index]
+    break  # only use one fold
+    
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.hist(train_targets, bins=np.arange(targets.min(), targets.max() + 1), alpha=0.7, color='blue', label='Train Labels')
+plt.title('Train Set Label Distribution')
+plt.xlabel('Label')
+plt.ylabel('Frequency')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.hist(val_targets, bins=np.arange(targets.min(), targets.max() + 1), alpha=0.7, color='orange', label='Validation Labels')
+plt.title('Validation Set Label Distribution')
+
+print(f"### in total there are {len(train_features)} in train###")
+print(f"### in total there are {len(val_features)} in val###")
+
+## Create dataloader
+
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+import random
+
+
+batch_size=32
+
+class SAKTDataset(Dataset):
+    def __init__(self, features, targets, train=True): #HDKIM 100
+        super(SAKTDataset, self).__init__()
+        self.features = features
+        self.targets = targets
+        
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+        return self.features[index].astype('float32'),self.targets[index]#.astype('float32')
+
+class TestDataset(Dataset):
+    def __init__(self, features, targets): #HDKIM 100
+        super(TestDataset, self).__init__()
+        self.features = features
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+
+        return self.features[index].astype('float32'),self.targets[index]#.astype('float32')
+
+train_dataset = SAKTDataset(train_features,train_targets)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+del train_features
+
+val_dataset = SAKTDataset(val_features,val_targets)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+del val_features
