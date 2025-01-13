@@ -11,3 +11,5 @@ Source Voltage: 1V
 Sampling Rate: 100Hz
 10s Per Epoch (1000 points per epoch)
 
+Code in Python language
+
